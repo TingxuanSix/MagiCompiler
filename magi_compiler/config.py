@@ -154,6 +154,7 @@ class RecomputePolicy(Enum):
 
     HANDCRAFT = "HANDCRAFT"
     HEURISTIC = "HEURISTIC"
+    RESIDENT_RATIO = "RESIDENT_RATIO"
     AUTOSEARCH = "AUTOSEARCH"
 
 
@@ -184,12 +185,19 @@ class OffloadPolicy(Enum):
     BASE = "BASE"
     COST_EFFECTIVE = "COST_EFFECTIVE"
     HEURISTIC = "HEURISTIC"
+    RESIDENT_RATIO = "RESIDENT_RATIO"
 
 
 class OffloadConfig(BaseModel):
     model_cpu_offload: bool = Field(False, description="Whether to offload the model to CPU.")
+    defer_weight_pinning: bool = Field(
+        False, description="Register offloaded CPU storage after cold execution, suspending registration for cold entries."
+    )
+    synchronize_compile: bool = Field(
+        False, description="Synchronize cold offload entries across ranks using CPU/gloo barriers."
+    )
     gpu_resident_weight_ratio: float = Field(
-        0.3, description="The ratio of GPU memory to keep when offloading the model to CPU."
+        0.3, ge=0.0, le=1.0, description="The ratio of GPU memory to keep when offloading the model to CPU."
     )
     offload_policy: OffloadPolicy = Field(
         OffloadPolicy.COST_EFFECTIVE, description="The policy for offloading the model to CPU."
@@ -312,6 +320,10 @@ class CompileConfig(BaseSettings):
     # ---- Basic configs ----
     backend: Literal["inductor", "eager"] = Field(
         "inductor", description="TorchInductor backend to use. 'inductor' for optimized codegen, 'eager' for debugging."
+    )
+    dynamo_config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Per-model Dynamo tracing overrides, restored after compilation.",
     )
     compile_mode: CompileMode = Field(
         default=CompileMode.MAGI_COMPILE,

@@ -14,7 +14,8 @@
 
 
 import ctypes
-import os
+import ctypes.util
+import weakref
 
 import torch
 
@@ -25,13 +26,16 @@ def init_cudart():
     global _cudart
     if _cudart is not None:
         return _cudart
-    candidates = ["libcudart.so", "libcudart.so.11.0", "libcudart.so.12.0, libcudart.so.13"]
-    try:
-        cuda_path = os.path.dirname(torch.utils.cpp_extension._find_cuda_home())
-        candidates.append(os.path.join(cuda_path, "lib64", "libcudart.so"))
-    except:
-        pass
+    if torch.version.hip is not None:
+        candidates = [ctypes.util.find_library("amdhip64"), "libamdhip64.so"]
+    else:
+        candidates = [
+            ctypes.util.find_library("cudart"), "libcudart.so",
+            "libcudart.so.11.0", "libcudart.so.12", "libcudart.so.13",
+        ]
     for lib in candidates:
+        if lib is None:
+            continue
         try:
             _cudart = ctypes.CDLL(lib)
             return _cudart
@@ -42,21 +46,41 @@ def init_cudart():
 
 def pin_memory_in_place(tensor: torch.Tensor):
     """
-    Pin memory in-place using cudaHostRegister.
+    Register existing CPU storage with CUDA/HIP, without allocating host memory
+    through the accelerator allocator. The owner must outlive all tensor views.
     """
-    if tensor.is_cuda:
+    if tensor.is_cuda or tensor.numel() == 0:
+        return tensor
+    # Host registration before PyTorch initializes its device context is not
+    # recognized by is_pinned() on the HCU runtime.
+    torch.cuda.init()
+    if tensor.is_pinned():
         return tensor
     cudart = init_cudart()
     if cudart is None:
-        return tensor
+        raise RuntimeError("Cannot register offload weights: CUDA/HIP runtime library not found")
 
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
-    res = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 0)
+    prefix = "hip" if torch.version.hip is not None else "cuda"
+    register = getattr(cudart, prefix + "HostRegister")
+    unregister = getattr(cudart, prefix + "HostUnregister")
+    res = register(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 0)
 
-    # 0: success, 712: already registered
-    # https://www.autodesk.com/support/technical/article/caas/sfdcarticles/sfdcarticles/GPU-and-CUDA-call-failed-error-messages-with-Arnold-5-3-5-and-Maya-2024.html
-    if res == 0 or res == 712:
-        return tensor
-    else:
-        raise RuntimeError(f"cudaHostRegister failed with error code {res}")
+    # 0: success, 712: already registered; only unregister storage we own.
+    if res not in (0, 712):
+        raise RuntimeError(f"{prefix}HostRegister failed with error code {res}")
+    if res == 0:
+        tensor._magi_host_registration = weakref.finalize(tensor, unregister, ctypes.c_void_p(ptr))
+    return tensor
+
+
+def unpin_memory_in_place(tensor: torch.Tensor):
+    """Undo a registration owned by MagiCompiler, preserving the CPU storage."""
+    registration = getattr(tensor, "_magi_host_registration", None)
+    if registration is not None and registration.alive:
+        _, unregister, args, kwargs = registration.peek()
+        result = unregister(*args, **kwargs)
+        if result != 0:
+            raise RuntimeError(f"HostUnregister failed with error code {result}")
+        registration.detach()

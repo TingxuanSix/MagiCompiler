@@ -14,21 +14,48 @@
 
 import collections
 import operator
+import weakref
 from typing import Any, Dict
 
 import torch
 from torch.fx import GraphModule, Node
 from torch.fx.node import map_arg
 
-from magi_compiler.config import CompileConfig
+from magi_compiler.config import CompileConfig, OffloadPolicy
 from magi_compiler.offload.profiler import OffloadProfiler
 from magi_compiler.offload.scheduler import OffloadRuntimeContext, SchedulerFactory
+from magi_compiler.offload.host_weights import is_offload_weight
+from magi_compiler.utils import magi_logger
 from magi_compiler.utils.nvtx import add_nvtx_event
 
 from ..magi_depyf.timeline import observe_lifecycle
 
 
+_executors = weakref.WeakSet()
+_resident_cache = weakref.WeakValueDictionary()
+
+
+def release_offload_caches() -> int:
+    """Release inactive offload executors' device caches at a stage boundary.
+
+    Preserve profiling/schedules; the next call reloads resident weights and
+    demand-loads any first-submodule weights whose handoff was discarded.
+    Call only when no offload graph is executing in this process.
+    """
+    executors = list(_executors)
+    for executor in executors:
+        executor.compute_stream.synchronize()
+        executor.h2d_stream.synchronize()
+        executor.persistent_weights.clear()
+        executor.submod_0_weight_handoff.clear()
+    _resident_cache.clear()
+    return len(executors)
+
+
 class OffloadExecutor:
+    def _copy_to_device(self, value):
+        return value.to("cuda", non_blocking=value.is_pinned())
+
     def __init__(self, graph_module: GraphModule, compile_config: CompileConfig):
         self.graph_module = graph_module
         self.compile_config = compile_config
@@ -36,7 +63,8 @@ class OffloadExecutor:
         self.compute_stream = torch.cuda.current_stream()
         self.h2d_stream = torch.cuda.Stream()
 
-        self.warmup = True
+        self.fixed_residency = compile_config.offload_config.offload_policy == OffloadPolicy.RESIDENT_RATIO
+        self.warmup = not self.fixed_residency
         self.second_call = False
         self.buffers: Dict[str, torch.Tensor] = {}
         self.persistent_weights: Dict[str, torch.Tensor] = {}
@@ -53,6 +81,7 @@ class OffloadExecutor:
         }
 
         self.scheduler = SchedulerFactory.create(self.compile_config, common_args)
+        _executors.add(self)
 
     def _analyze_graph(self):
         self.submod_nodes = [n for n in self.graph_module.graph.nodes if n.op == "call_module"]
@@ -80,13 +109,11 @@ class OffloadExecutor:
         for node in self.submod_nodes:
             weight_names = []
             size = 0
-            for arg in node.args:
-                if isinstance(arg, Node) and self._is_weight_node(arg):
-                    if arg.name in self.name_node_map:
-                        weight_names.append(arg.name)
-                        val = arg.meta.get("example_value")
-                        if val is not None:
-                            size += val.numel() * val.element_size()
+            for arg in node.all_input_nodes:
+                if self._is_weight_node(arg):
+                    weight_names.append(arg.name)
+                    val = arg.meta["example_value"]
+                    size += val.numel() * val.element_size()
 
             self.submod_weights_map[node.name] = weight_names
             self.submod_weight_sizes[node.name] = size
@@ -95,6 +122,11 @@ class OffloadExecutor:
         return node.op == "placeholder" and isinstance(node.meta.get("example_value"), torch.nn.Parameter)
 
     def _prepare_inputs(self, args) -> Dict[Node, Any]:
+        if hasattr(self.scheduler, "select_weights"):
+            self.scheduler.select_weights({
+                node.name for index, node in enumerate(self.placeholder_nodes)
+                if self.arg_index_weight[index] and is_offload_weight(args[index])
+            })
         env = {}
         args = list(args)
         submod_0 = self.submod_nodes[0]
@@ -113,7 +145,16 @@ class OffloadExecutor:
             # case 2: kept weight
             if self.scheduler.is_kept(node.name):
                 if node.name not in self.persistent_weights:
-                    t = arg_val.to("cuda", non_blocking=False) if arg_val.device.type == "cpu" else arg_val
+                    # Multiple compiled entries for one block (e.g. HCU's
+                    # return-overlap variant) must share resident GPU copies.
+                    key = (
+                        arg_val.data_ptr(), tuple(arg_val.shape), tuple(arg_val.stride()),
+                        arg_val.dtype, arg_val._version, torch.cuda.current_device(),
+                    )
+                    t = _resident_cache.get(key)
+                    if t is None:
+                        t = arg_val.to("cuda", non_blocking=False) if arg_val.device.type == "cpu" else arg_val
+                        _resident_cache[key] = t
                     self.persistent_weights[node.name] = t
                 env[node] = self.persistent_weights[node.name]
                 continue
@@ -122,11 +163,8 @@ class OffloadExecutor:
             if submod_0 in node.users:
                 if self.warmup and arg_val.device.type == "cpu":
                     self.buffers[node.name] = arg_val
-                    arg_val = arg_val.to("cuda", non_blocking=False)
                 elif not self.warmup:
-                    if node in self.submod_0_weight_handoff:
-                        arg_val = self.submod_0_weight_handoff[node]
-                        del self.submod_0_weight_handoff[node]
+                    arg_val = self.submod_0_weight_handoff.pop(node, arg_val)
 
             env[node] = arg_val
 
@@ -135,12 +173,20 @@ class OffloadExecutor:
     def _finalize_warmup(self):
         profile_results = self.profiler.summarize()
         self.scheduler.schedule_kept_weights(profile_results)
+        magi_logger.info(
+            "[offload] schedule ready: policy=%s total_weight_gib=%.3f resident_weight_gib=%.3f "
+            "prefetch_triggers=%d",
+            type(self.scheduler).__name__, sum(self.submod_weight_sizes.values()) / 2**30,
+            self.scheduler.get_keep_weight_size() / 2**30,
+            len(getattr(self.scheduler, "prefetch_schedule", {})),
+        )
         self.warmup = False
 
     def __call__(self, *args):
         if len(self.submod_nodes) == 0:
             return self.graph_module(*args)
 
+        self.compute_stream = torch.cuda.current_stream()
         env = self._prepare_inputs(args)
         current_user_counts = self.user_counts.copy()
         runtime_ctx = OffloadRuntimeContext(
@@ -150,6 +196,7 @@ class OffloadExecutor:
             buffers=self.buffers,
             submod_0_handoff=self.submod_0_weight_handoff,
             need_profile=self.second_call or self.warmup,
+            transfer=self._copy_to_device,
         )
         need_profile = self.second_call
 
@@ -159,6 +206,17 @@ class OffloadExecutor:
 
             elif node.op == "call_module":
                 self.scheduler.prefetch(node.name, runtime_ctx)
+
+                # Cold stage re-entry, lookahead=0, or a gap of weightless
+                # submodules must never pass a CPU parameter into a GPU kernel.
+                # Normal scheduled prefetch replaces env already; this is only
+                # the correctness fallback for weights not prefetched.
+                with torch.cuda.stream(self.compute_stream):
+                    for weight_name in self.submod_weights_map[node.name]:
+                        weight_node = self.name_node_map[weight_name]
+                        value = env[weight_node]
+                        if value.device.type == "cpu":
+                            env[weight_node] = self._copy_to_device(value)
 
                 if need_profile:
                     if torch.distributed.is_initialized():
@@ -195,6 +253,8 @@ class OffloadExecutor:
                 if self.warmup:
                     self.second_call = True
                     self.warmup = False
+                    # The outer compilation context registers CPU owners only
+                    # after all ranks finish cold execution and synchronize.
 
                 return map_arg(node.args[0], lambda n: env[n])
 

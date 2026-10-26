@@ -15,7 +15,7 @@
 import abc
 import collections
 from dataclasses import dataclass
-from typing import Any, Dict, List, Set, Type
+from typing import Any, Callable, Dict, List, Set, Type
 
 import torch
 from torch.fx import Node
@@ -36,6 +36,10 @@ class OffloadRuntimeContext:
     buffers: Dict[str, torch.Tensor]  # GPU copies stored during Warmup
     submod_0_handoff: Dict[Node, torch.Tensor]  # Container for weights used by Submod 0 for the next iteration
     need_profile: bool = False
+    transfer: Callable | None = None
+
+    def to_device(self, value):
+        return self.transfer(value) if self.transfer else value.to("cuda", non_blocking=True)
 
 
 SchedulerType = Type["OffloadScheduler"]
@@ -465,3 +469,59 @@ class HeuristicScheduler(BaseScheduler):
                     submod_0_next_iter_weights[w_node] = buffers[w_name].to("cuda", non_blocking=True)
 
             self.submod_load_events[h2d_node.name].record(h2d_stream)
+
+
+@SchedulerFactory.register("RESIDENT_RATIO")
+class ResidentRatioScheduler(OffloadScheduler):
+    """Keep the byte-budget partition fixed throughout the Preview stage."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.offloaded_weights = None
+        self.prefetch_schedule = collections.defaultdict(list)
+        self.weight_events = {}
+        self.targets = {}
+
+    def select_weights(self, names):
+        if self.offloaded_weights is not None:
+            if names != self.offloaded_weights:
+                raise RuntimeError("CPU weight storage changed; rebuild the offload entry")
+            return
+        self.offloaded_weights = set(names)
+        all_weights = {name for name, node in self.name_node_map.items()
+                       if isinstance(node.meta.get("example_value"), torch.nn.Parameter)}
+        self.kept_weights = all_weights - names
+        unseen = set(names)
+        for index, node in enumerate(self.submod_nodes):
+            weights = unseen.intersection(self.submod_weights_map[node.name])
+            if weights:
+                self.targets[index] = weights
+                unseen.difference_update(weights)
+                lookahead = max(0, self.compile_config.offload_config.max_prefetch_lookahead)
+                trigger = max(0, index - lookahead)
+                self.prefetch_schedule[self.submod_nodes[trigger].name].append(index)
+
+    def schedule_kept_weights(self, profile_data):
+        # Profiling must not promote offloaded parameters and change the ratio.
+        pass
+
+    def _load(self, names, ctx):
+        with torch.cuda.stream(ctx.h2d_stream):
+            for name in names:
+                node = self.name_node_map[name]
+                value = ctx.env.get(node)
+                if value is not None and value.device.type == "cpu":
+                    ctx.env[node] = ctx.to_device(value)
+                    if name not in self.weight_events:
+                        self.weight_events[name] = torch.cuda.Event()
+                    self.weight_events[name].record(ctx.h2d_stream)
+
+    def prefetch(self, current_node_name, ctx):
+        current = self.offloaded_weights.intersection(self.submod_weights_map[current_node_name])
+        self._load(current, ctx)
+        for name in current:
+            event = self.weight_events.get(name)
+            if event is not None:
+                ctx.compute_stream.wait_event(event)
+        for target in self.prefetch_schedule.get(current_node_name, ()):
+            self._load(self.targets[target], ctx)

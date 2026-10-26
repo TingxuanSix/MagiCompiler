@@ -17,7 +17,7 @@ import gc
 import hashlib
 import inspect
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable
 from unittest.mock import patch
 
@@ -28,12 +28,14 @@ from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
 from magi_compiler.config import debug_dump_path, inductor_cache_dump_path, triton_cache_dump_path
 from magi_compiler.cuda.cudart import pin_memory_in_place
+from magi_compiler.offload.weight_layout import choose_offload_weights
+from magi_compiler.offload.host_weights import register_offload_owner, pin_offload_weights, suspend_offload_registration
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
 from magi_compiler.utils.host_memory import fmt_host_mem
 
-from .config import CompileConfig, CompileMode
+from .config import CompileConfig, CompileMode, OffloadPolicy
 
 
 # =============================================================================
@@ -63,14 +65,14 @@ _DEFAULT_DYNAMO_CONFIG: dict = torch._dynamo.config.get_config_copy()
 
 
 @contextmanager
-def _isolated_dynamo_config():
+def _isolated_dynamo_config(overrides: dict | None = None):
     """
     Context manager that provides an isolated dynamo config environment.
 
     Ensures that any changes made to torch._dynamo.config within this block
     do not leak out to the global state.
     """
-    with torch._dynamo.config.patch(**_DEFAULT_DYNAMO_CONFIG):
+    with torch._dynamo.config.patch(**{**_DEFAULT_DYNAMO_CONFIG, **(overrides or {})}):
         yield
 
 
@@ -128,7 +130,7 @@ def _run_orchestration(state: MagiCompileState, args, kwargs):
             state._ensure_compiled()
             # First invocation triggers lazy Dynamo tracing; apply the
             # isolated config so _DEFAULT_DYNAMO_CONFIG overrides take effect.
-            with _isolated_dynamo_config():
+            with _isolated_dynamo_config(state.compile_config.dynamo_config):
                 return state.compiled_entry(*args, **kwargs)
         return state.compiled_entry(*args, **kwargs)
 
@@ -463,7 +465,9 @@ def _compilation_context(state: MagiCompileState):
     _triton_cache_dump_path = triton_cache_dump_path(state.compile_config.cache_root_dir)
 
     with (
-        _isolated_dynamo_config(),
+        suspend_offload_registration(state.compile_config.offload_config.synchronize_compile)
+        if state.compile_config.offload_config.defer_weight_pinning else nullcontext(),
+        _isolated_dynamo_config(state.compile_config.dynamo_config),
         patch.object(torch._dynamo.config, "assume_static_by_default", False),
         patch.object(torch._dynamo.config, "enable_cpp_symbolic_shape_guards", False),
         patch.object(torch._dynamo.config, "force_nn_module_property_static_shapes", False),
@@ -681,6 +685,11 @@ def _materialize_shm_weights(
 
 
 def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
+    fixed_ratio = conf.offload_config.offload_policy == OffloadPolicy.RESIDENT_RATIO
+    if conf.offload_config.defer_weight_pinning and (
+        not fixed_ratio or conf.aot or conf.compile_mode != CompileMode.MAGI_COMPILE
+    ):
+        raise ValueError("Deferred weight pinning requires RESIDENT_RATIO MAGI_COMPILE with aot=False")
     magi_logger.info(f"Enabling CPU offload for {cls}")
     _orig_apply = cls._apply
 
@@ -734,7 +743,38 @@ def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
         magi_logger.info('[offload] after _force_cpu: %s', fmt_host_mem())
 
         # create shared memory tensors for all parameters/buffers on CPU
-        if dist.is_initialized():
+        if fixed_ratio:
+            # Choose before allocating/registering any CPU storage. Buffers are
+            # kept outside the parameter-byte budget and are never host-registered.
+            parameters = dict(self.named_parameters())
+            offloaded = choose_offload_weights(parameters, conf.offload_config.gpu_resident_weight_ratio)
+            total_bytes = sum(value.numel() * value.element_size() for value in parameters.values())
+            del parameters
+            groups = {}
+            for name, tensor in self.state_dict().items():
+                groups.setdefault((tensor.dtype, name in offloaded), []).append((name, tensor))
+            owners = []
+            selected_bytes = 0
+            for (_, selected), entries in groups.items():
+                owner = torch.empty(sum(t.numel() for _, t in entries), dtype=entries[0][1].dtype, device="cpu")
+                _stream_copy_and_replace(self, owner, entries)
+                owners.append(owner)
+                if selected:
+                    register_offload_owner(owner, torch.cuda.current_device())
+                    selected_bytes += owner.numel() * owner.element_size()
+            self._magi_giant_buffers = owners
+            if not conf.offload_config.defer_weight_pinning:
+                pin_offload_weights()
+            magi_logger.info(
+                "[offload] fixed residency: requested_ratio=%.4f actual_ratio=%.4f "
+                "parameter_gib=%.3f resident_gib=%.3f registration_gib=%.3f offloaded_tensors=%d deferred=%s",
+                conf.offload_config.gpu_resident_weight_ratio,
+                (total_bytes - selected_bytes) / total_bytes if total_bytes else 1.0,
+                total_bytes / 2**30, (total_bytes - selected_bytes) / 2**30,
+                selected_bytes / 2**30, len(offloaded), conf.offload_config.defer_weight_pinning,
+            )
+
+        elif dist.is_initialized():
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             full_state_dict = self.state_dict()
 

@@ -190,6 +190,7 @@ class OffloadPolicy(Enum):
 
 class OffloadConfig(BaseModel):
     model_cpu_offload: bool = Field(False, description="Whether to offload the model to CPU.")
+    preserve_cpu_storage: bool = Field(False, description="Reuse existing CPU tensor views without giant owner copies; fixed-ratio only.")
     defer_weight_pinning: bool = Field(
         False, description="Register offloaded CPU storage after cold execution, suspending registration for cold entries."
     )
@@ -365,6 +366,14 @@ class CompileConfig(BaseSettings):
     )
 
     # ---- Inductor configs ----
+    inductor_emulate_precision_casts: bool | None = Field(
+        None,
+        description=(
+            "Per-entry Inductor precision-cast policy. None inherits PyTorch's default; "
+            "True preserves eager low-precision rounding without changing global "
+            "settings or independently compiled operators. Included in cache hashes."
+        ),
+    )
     enable_inductor_max_autotune: bool = Field(False, description="Enable Inductor max_autotune for kernel selection.")
     enable_inductor_coordinate_descent_tuning: bool = Field(
         False, description="Enable Inductor coordinate_descent_tuning for kernel selection."

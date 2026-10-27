@@ -12,15 +12,15 @@ _owners = []
 _suspend_depth = 0
 
 
-def register_offload_owner(owner, device):
+def register_offload_owner(owner, device, pin=True):
     # Only weak references: the model owns the CPU storage and its registration.
-    _owners.append((weakref.ref(owner), device))
+    _owners.append((weakref.ref(owner), device, pin))
 
 
 def _live_owners():
-    live = [(ref(), device) for ref, device in _owners]
-    live = [(owner, device) for owner, device in live if owner is not None]
-    _owners[:] = [(weakref.ref(owner), device) for owner, device in live]
+    live = [(ref(), device, pin) for ref, device, pin in _owners]
+    live = [(owner, device, pin) for owner, device, pin in live if owner is not None]
+    _owners[:] = [(weakref.ref(owner), device, pin) for owner, device, pin in live]
     return live
 
 
@@ -30,13 +30,15 @@ def is_offload_weight(value):
     start = value.data_ptr()
     end = start + value.numel() * value.element_size()
     return any(owner.data_ptr() <= start and end <= owner.data_ptr() + owner.numel() * owner.element_size()
-               for owner, _ in _live_owners())
+               for owner, _, _ in _live_owners())
 
 
 def pin_offload_weights():
     if _suspend_depth:
         return
-    for owner, device in _live_owners():
+    for owner, device, pin in _live_owners():
+        if not pin:
+            continue
         with torch.cuda.device(device):
             pin_memory_in_place(owner)
 
@@ -60,18 +62,20 @@ def suspend_offload_registration(synchronize_ranks=False):
                 group = get_cpu_gloo_group()
                 if group is None:
                     raise RuntimeError("Deferred offload registration requires a CPU/gloo group")
-            for device in {device for _, device in _live_owners()}:
+            for device in {device for _, device, _ in _live_owners()}:
                 torch.cuda.synchronize(device)
             if group is not None:
                 torch.distributed.barrier(group=group)
-            for owner, device in _live_owners():
+            for owner, device, pin in _live_owners():
+                if not pin:
+                    continue
                 with torch.cuda.device(device):
                     unpin_memory_in_place(owner)
             if group is not None:
                 torch.distributed.barrier(group=group)
         yield
         if outermost:
-            for device in {device for _, device in _live_owners()}:
+            for device in {device for _, device, _ in _live_owners()}:
                 torch.cuda.synchronize(device)
             if group is not None:
                 torch.distributed.barrier(group=group)

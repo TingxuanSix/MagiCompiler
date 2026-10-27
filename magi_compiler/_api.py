@@ -689,6 +689,9 @@ def _materialize_shm_weights(
 
 def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
     fixed_ratio = conf.offload_config.offload_policy == OffloadPolicy.RESIDENT_RATIO
+    if conf.offload_config.preserve_cpu_storage:
+        if not fixed_ratio:
+            raise ValueError("Preserved CPU storage requires RESIDENT_RATIO")
     if conf.offload_config.defer_weight_pinning and (
         not fixed_ratio or conf.aot or conf.compile_mode != CompileMode.MAGI_COMPILE
     ):
@@ -752,6 +755,17 @@ def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
             parameters = dict(self.named_parameters())
             offloaded = choose_offload_weights(parameters, conf.offload_config.gpu_resident_weight_ratio)
             total_bytes = sum(value.numel() * value.element_size() for value in parameters.values())
+            if conf.offload_config.preserve_cpu_storage:
+                # Each owner is the exact view, not the whole mapped shard storage.
+                # The module retains those views; no checkpoint mutation or copies.
+                owners = [tensor.detach() for name, tensor in parameters.items() if name in offloaded]
+                for owner in owners:
+                    register_offload_owner(owner, torch.cuda.current_device(), pin=False)
+                self._magi_giant_buffers = owners
+                self._magi_offloaded_once = True
+                magi_logger.info("[offload] reused pageable CPU views: %d tensors, %.3f GiB", len(owners),
+                                 sum(t.numel() * t.element_size() for t in owners) / 2**30)
+                return self
             del parameters
             groups = {}
             for name, tensor in self.state_dict().items():

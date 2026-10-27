@@ -97,6 +97,10 @@ class MagiCompileState:
         self.dynamic_arg_dims = dynamic_arg_dims
         self.traced_files: OrderedSet = OrderedSet()
         self.inductor_compile_config: dict = {}
+        if compile_config.inductor_emulate_precision_casts is not None:
+            self.inductor_compile_config["emulate_precision_casts"] = (
+                compile_config.inductor_emulate_precision_casts
+            )
         self.target_method_name: str | None = None
         self.target_function: Callable | None = None
 
